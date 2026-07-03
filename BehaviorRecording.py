@@ -3,7 +3,7 @@ BehaviorRecording.py
 
 Behavior Recording
 ===================
-Multi-camera video acquisition end load cell recording for behavioral conditioning setups.
+Multi-camera video acquisition and load cell recording for behavioral conditioning setups.
 
 DESCRIPTION:
     Provides live preview and independent recording of up to 4 USB
@@ -54,11 +54,27 @@ FEATURES:
       history. An optional moving-average smoothing can be applied to
       the live plot for readability — this is display-only and never
       affects the raw values written to the recording log.
+    - Event marking: an "Events" button (enabled only while recording)
+      draws a vertical line on the live plot and flags the nearest
+      sample in the CSV. mark_event(code) is also public API, so another
+      application can trigger it directly (e.g. Conditioning Setup marks
+      each stimulus onset via window.mark_event(code)). Codes: 1=Sound,
+      2=Light, 3=Shock, 4=Trigger 1, 5=Trigger 2, 6=this window's own
+      manual button. Each code gets its OWN 0/1 column in the CSV
+      (Sound, Light, Shock, Trigger1, Trigger2, Manual) rather than one
+      shared column, so simultaneous events (e.g. Sound and Light onset
+      at the same instant) don't overwrite each other.
+    - Settings > Video...: a live camera adjustment panel (Brightness/
+      Contrast/Sharpness sliders applying in real time, plus Resolution
+      via an explicit Apply button) affecting every currently active
+      camera at once. Support for these properties is driver/OS-
+      dependent — some cameras or backends (notably AVFoundation on
+      macOS) silently ignore brightness/contrast/sharpness; resolution
+      tends to be the most reliably supported of the four.
 
 PLANNED (not yet implemented):
     - A second, third, and fourth independent signal channel (multiple
       load cells), mirroring the camera grid's approach.
-    - Event marking and behavioral epoch analysis.
     - Per-sample / per-frame timestamp logging, to allow precise post-hoc
       alignment between cameras and the signal channel(s).
 
@@ -85,7 +101,8 @@ REQUIREMENTS:
 AUTHOR:
     Flavio Mourao (mourao.fg@gmail.com)
 
-Started: 07/2026
+Started:     04/2026
+Last update: 07/2026
 """
 
 import sys
@@ -100,11 +117,61 @@ import serial.tools.list_ports
 import pyqtgraph as pg
 from PyQt5 import QtWidgets, QtCore, QtGui
 
+# Theme
+BG        = "#141414"
+BG_PANEL  = "#141414"
+TEXT      = "#c8c8c8"
+BORDER    = "#2a2a2a"
+
+GLOBAL_STYLESHEET = f"""
+    QMainWindow, QWidget {{ background: {BG}; color: {TEXT}; }}
+    QGroupBox {{ background: {BG_PANEL}; border: 1px solid {BORDER}; }}
+    QGroupBox::title {{ color: {TEXT}; }}
+"""
+
+# Cameras
 MAX_CAMERAS = 4
 
 VIDEO_FORMATS = {
     "AVI (MJPG)": (".avi", "MJPG"),
     "MP4 (mp4v)": (".mp4", "mp4v"),
+}
+
+# Numeric codes identifying each event type. Each code gets its own 0/1
+# column in the CSV (see EVENT_COLUMNS below), and its own vertical-line
+# color on the live plot (see EVENT_COLORS). 1-5 are meant to be
+# triggered externally (e.g. by Conditioning Setup, one per stimulus
+# type); 6 is the manual "Events" button in this window. Colors 1-5
+# match Conditioning Setup's own stimulus color scheme (ACC_BLUE/
+# ACC_YELL/ACC_RED/ACC_TRG1/ACC_TRG2) for visual consistency between the
+# two apps.
+EVENT_LABELS = {
+    1: "Sound",
+    2: "Light",
+    3: "Shock",
+    4: "Trigger 1",
+    5: "Trigger 2",
+    6: "Manual",
+}
+EVENT_COLORS = {
+    1: (68, 170, 255, 160),    # blue
+    2: (255, 170, 68, 160),    # yellow/orange
+    3: (238, 68, 68, 160),     # red
+    4: (170, 170, 170, 160),   # light grey
+    5: (85, 85, 85, 160),      # dark grey
+    6: (150, 150, 150, 150),   # neutral grey (manual button press)
+}
+# CSV column names (space-free) for the per-event-type Event columns, in
+# the order they're written. Using one 0/1 column per event type (instead
+# of a single categorical column) means simultaneous events at the same
+# sample no longer collide/overwrite each other.
+EVENT_COLUMNS = {
+    1: "Sound",
+    2: "Light",
+    3: "Shock",
+    4: "Trigger1",
+    5: "Trigger2",
+    6: "Manual",
 }
 
 
@@ -131,6 +198,8 @@ class CameraWorker(QtCore.QThread):
         super().__init__(parent)
         self.index    = index
         self._running = False
+        self.cap        = None              # set once opened in run(); guarded by _prop_lock
+        self._prop_lock = threading.Lock()
 
     def run(self):
         cap = cv2.VideoCapture(self.index)
@@ -138,6 +207,7 @@ class CameraWorker(QtCore.QThread):
             self.error.emit(self.index, f"Could not open camera {self.index}.")
             return
 
+        self.cap      = cap
         self._running = True
         while self._running:
             ret, frame = cap.read()
@@ -150,6 +220,35 @@ class CameraWorker(QtCore.QThread):
             self.frame_ready.emit(self.index, frame)
 
         cap.release()
+        self.cap = None
+
+    def set_property(self, prop_id, value):
+        """
+        Thread-safe: request a cv2.VideoCapture property change (e.g.
+        brightness, resolution) from the main thread while this worker's
+        run() loop is reading frames on its own thread.
+
+        Support for these properties is driver/OS-dependent — some
+        cameras or backends silently ignore unsupported properties
+        (cv2 won't raise an error either way).
+        """
+        with self._prop_lock:
+            if self.cap is not None:
+                try:
+                    self.cap.set(prop_id, value)
+                except Exception:
+                    pass
+
+    def get_property(self, prop_id):
+        """Thread-safe read of a current camera property value, or None
+        if unavailable."""
+        with self._prop_lock:
+            if self.cap is not None:
+                try:
+                    return self.cap.get(prop_id)
+                except Exception:
+                    return None
+        return None
 
     def stop(self):
         """Ask the run() loop to exit; it releases the camera on its way out."""
@@ -241,10 +340,106 @@ class SerialWorker(QtCore.QThread):
         self._running = False
 
 
+class VideoSettingsDialog(QtWidgets.QDialog):
+    """
+    Live camera adjustment panel reachable from Settings > Video...
+    Brightness/Contrast/Sharpness apply in real time as each slider
+    moves; Resolution applies via an explicit button (changing
+    resolution mid-stream can cause a brief visual hiccup, so it isn't
+    tied to a slider).
+
+    The SAME value is applied to every currently active camera at once
+    (not per-camera individually).
+
+    IMPORTANT: actual hardware/driver support for these properties
+    varies a lot by OS and camera. Some backends (notably AVFoundation
+    on macOS) accept the cv2.VideoCapture.set() call without error but
+    do not actually change anything for brightness/contrast/sharpness.
+    Resolution tends to be the most reliably supported of the four.
+    """
+    RESOLUTIONS = ["640x480", "1280x720", "1920x1080"]
+
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.setWindowTitle("Video Settings")
+        self.setMinimumWidth(380)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        note = QtWidgets.QLabel(
+            "Applies to all active cameras at once. Support for these "
+            "controls depends on your camera/driver — some settings may "
+            "not have any visible effect on certain cameras.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(note)
+
+        self._add_slider(layout, "Brightness", cv2.CAP_PROP_BRIGHTNESS)
+        self._add_slider(layout, "Contrast",   cv2.CAP_PROP_CONTRAST)
+        self._add_slider(layout, "Sharpness",  cv2.CAP_PROP_SHARPNESS)
+
+        # -- Resolution --
+        res_layout = QtWidgets.QHBoxLayout()
+        res_layout.addWidget(QtWidgets.QLabel("Resolution:"))
+        self.combo_resolution = QtWidgets.QComboBox()
+        self.combo_resolution.addItems(self.RESOLUTIONS)
+        res_layout.addWidget(self.combo_resolution)
+
+        btn_apply_res = QtWidgets.QPushButton("Apply Resolution")
+        btn_apply_res.clicked.connect(self.apply_resolution)
+        res_layout.addWidget(btn_apply_res)
+        layout.addLayout(res_layout)
+
+        btn_close = QtWidgets.QPushButton("Close")
+        btn_close.clicked.connect(self.close)
+        layout.addWidget(btn_close)
+
+    def _add_slider(self, layout, label_text, prop_id):
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel(label_text + ":"))
+
+        slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        slider.setRange(0, 100)
+
+        # Best-effort initial value: query the first active camera; if
+        # the driver doesn't report a usable value, default to the
+        # middle of the range (50).
+        first_worker = next(iter(self.main_window.cam_workers.values()))
+        current = first_worker.get_property(prop_id)
+        initial = int(current) if current is not None and 0 <= current <= 100 else 50
+        slider.setValue(initial)
+
+        spin = QtWidgets.QSpinBox()
+        spin.setRange(0, 100)
+        spin.setValue(initial)
+
+        slider.valueChanged.connect(spin.setValue)
+        spin.valueChanged.connect(slider.setValue)
+        slider.valueChanged.connect(lambda v, p=prop_id: self._apply_to_all(p, v))
+
+        row.addWidget(slider, 1)
+        row.addWidget(spin)
+        layout.addLayout(row)
+
+    def _apply_to_all(self, prop_id, value):
+        for worker in self.main_window.cam_workers.values():
+            worker.set_property(prop_id, value)
+
+    def apply_resolution(self):
+        w_str, h_str = self.combo_resolution.currentText().split("x")
+        w, h = int(w_str), int(h_str)
+        for worker in self.main_window.cam_workers.values():
+            worker.set_property(cv2.CAP_PROP_FRAME_WIDTH, w)
+            worker.set_property(cv2.CAP_PROP_FRAME_HEIGHT, h)
+
+
 class BehaviorRecording(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Behavior Recording")
+        self.setStyleSheet(GLOBAL_STYLESHEET)
+        
         self.resize(1300, 700)
 
         self.cam_workers   = {}    # camera index -> CameraWorker
@@ -258,6 +453,8 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         self.record_start_time = None
         self.session_timestamp = None   # shared across video files + signal log, per session
         self.signal_log_rows   = []     # (elapsed_s_since_record_start, value), logged while recording
+        self.event_times_rec   = []     # (elapsed_s_since_record_start, code) per mark_event() call -- own vs external
+        self.event_lines       = []     # pg.InfiniteLine items drawn on the live plot for each Events click
 
         self.rec_clock_timer = QtCore.QTimer()
         self.rec_clock_timer.timeout.connect(self.update_recording_clock)
@@ -274,6 +471,13 @@ class BehaviorRecording(QtWidgets.QMainWindow):
     # GUI SETUP
 
     def setup_gui(self):
+        # -- Menu bar --
+        menubar = self.menuBar()
+        settings_menu = menubar.addMenu("Settings")
+        action_video = QtWidgets.QAction("Video...", self)
+        action_video.triggered.connect(self.open_video_settings)
+        settings_menu.addAction(action_video)
+
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QtWidgets.QHBoxLayout(central_widget)
@@ -341,10 +545,12 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         plot_layout = QtWidgets.QVBoxLayout()
 
         self.plot_signal = pg.PlotWidget(title="")
-        self.plot_signal.setBackground('w')
+        self.plot_signal.setBackground('#141414')
         self.plot_signal.setLabel('bottom', 'Time', 's')
-        self.curve_signal = self.plot_signal.plot(pen=pg.mkPen('#0072BD', width=1))
-
+        #self.curve_signal = self.plot_signal.plot(pen=pg.mkPen('#0072BD', width=2)) # BLUE
+        #self.curve_signal = self.plot_signal.plot(pen=pg.mkPen('#D95319', width=2)) # ORANGE
+        self.curve_signal = self.plot_signal.plot(pen=pg.mkPen('#c22017', width=2)) # RED
+        
         # -- Display mode: scrolling window vs. full growing history --
         display_layout = QtWidgets.QHBoxLayout()
         display_layout.addWidget(QtWidgets.QLabel("View:"))
@@ -402,12 +608,21 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         port_layout.addWidget(self.combo_baud)
         port_layout.addStretch()
 
-        # -- Tare --
+        # -- Tare / Events --
         tare_layout = QtWidgets.QHBoxLayout()
         self.btn_tare = QtWidgets.QPushButton("Tare")
         self.btn_tare.clicked.connect(self.tare_signal)
         self.btn_tare.setEnabled(False)
         tare_layout.addWidget(self.btn_tare)
+
+        self.btn_events = QtWidgets.QPushButton("Events")
+        self.btn_events.setToolTip(
+            "Marks the current moment as a manual event: draws a line on "
+            "the live plot and sets a 1 in the CSV's 'Manual' column at "
+            "the nearest sample. Enabled only while recording.")
+        self.btn_events.clicked.connect(lambda checked=False: self.mark_event(6))
+        self.btn_events.setEnabled(False)
+        tare_layout.addWidget(self.btn_events)
         tare_layout.addStretch()
 
         self.lbl_signal_status = QtWidgets.QLabel("Status: idle")
@@ -427,9 +642,11 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         main_layout.addWidget(plot_group, 1)
 
         # -------------------------------------------------------
-        # BOTTOM BAR: Recording (governs camera video + load cell log
-        # together — kept visually separate from the Cameras panel above
-        # since "Start Recording" synchronizes both).
+        # RECORDING panel: governs camera video + load cell log together.
+        # Placed at the bottom of the LEFT (Cameras) column, not spanning
+        # the full window width, but visually its own box (separate from
+        # the camera controls above it) since "Start Recording" now
+        # synchronizes camera video and the load cell log together.
         rec_group  = QtWidgets.QGroupBox()
         rec_layout = QtWidgets.QVBoxLayout()
 
@@ -519,6 +736,18 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         if self.is_streaming:
             return
         self.rebuild_grid_layout(self.spin_num_cameras.value())
+
+    def open_video_settings(self):
+        """Settings > Video... — opens the live brightness/contrast/
+        sharpness/resolution adjustment panel for the active camera(s)."""
+        if not self.cam_workers:
+            QtWidgets.QMessageBox.information(
+                self, "No Camera Active",
+                "Start at least one camera before adjusting video settings.")
+            return
+        dialog = VideoSettingsDialog(self, parent=self)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        dialog.show()
 
     # ---------------------------------------------------------------
     # CAMERA CONTROL
@@ -699,6 +928,11 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         self.smooth_deque.clear()
         self.curve_signal.setData([], [])
 
+        # Clear any event markers drawn during a previous connection.
+        for line in self.event_lines:
+            self.plot_signal.removeItem(line)
+        self.event_lines = []
+
         self.lbl_signal_status.setText(f"Status: connecting to {port}...")
 
         self.serial_worker = SerialWorker(port, baud)
@@ -739,6 +973,54 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         if self.serial_worker is not None:
             self.serial_worker.send_tare()
             self.lbl_signal_status.setText("Status: connected (tare sent)")
+
+    def mark_event(self, code=6):
+        """
+        Marks "now" as an event of the given numeric code (see EVENT_LABELS/
+        EVENT_COLORS): 1=Sound, 2=Light, 3=Shock, 4=Trigger 1, 5=Trigger 2,
+        6=manual (this window's own "Events" button). Draws a vertical
+        line on the live plot in that code's color, and records
+        (elapsed_rec, code) — elapsed_rec is in the recording's own
+        elapsed-time reference, the same one used by signal_log_rows — so
+        write_signal_log() can flag the nearest sample in that code's own
+        CSV column (see EVENT_COLUMNS: each event type gets an
+        independent 0/1 column, so simultaneous events of different
+        codes landing on the same sample don't overwrite each other).
+
+        This can be called from outside this window (e.g. by
+        Conditioning Setup, once per stimulus onset, via
+        window.mark_event(code)) to log external stimulus events
+        alongside the load cell signal.
+
+        Only meaningful while recording — the manual button is disabled
+        otherwise, and external callers get a silent no-op — since
+        outside a recording session there is no elapsed_rec clock
+        (self.record_start_time) to log against.
+        """
+        if not self.is_recording or self.record_start_time is None:
+            return
+
+        color = EVENT_COLORS.get(code, (150, 150, 150, 150))
+
+        # Visual line: placed at the most recent point on the live
+        # plot's own timeline (elapsed seconds since the signal was
+        # connected — not the same clock as the recording's elapsed_rec,
+        # but visually correct since it matches whatever's on screen).
+        if self.signal_time:
+            line = pg.InfiniteLine(
+                pos=self.signal_time[-1], angle=90, movable=False,
+                pen=pg.mkPen(color=color, width=2))
+            self.plot_signal.addItem(line)
+            self.event_lines.append(line)
+
+        # CSV logging: elapsed time since the recording session started —
+        # the same reference frame as signal_log_rows entries.
+        elapsed_rec = time.perf_counter() - self.record_start_time
+        self.event_times_rec.append((elapsed_rec, code))
+        label = EVENT_LABELS.get(code, f"code {code}")
+        self.lbl_signal_status.setText(
+            f"Status: connected — event marked ({label}, "
+            f"{len(self.event_times_rec)} total)")
 
     def on_sample_ready(self, t, value):
         """Slot: runs on the main thread. Appends the new sample and
@@ -866,6 +1148,7 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         self.video_writers   = {}   # opened lazily per camera, on its first frame
         self.frames_written  = {}   # camera index -> frames written so far
         self.signal_log_rows = []   # (elapsed_s, value) logged by on_sample_ready()
+        self.event_times_rec = []   # reset for this session's own elapsed_rec clock
         self.is_recording     = True
         self.record_start_time = time.perf_counter()
 
@@ -873,6 +1156,7 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         self.btn_stop_rec.setEnabled(True)
         self.combo_format.setEnabled(False)
         self.spin_record_fps.setEnabled(False)
+        self.btn_events.setEnabled(True)
         self.lbl_rec_status.setText("Recording... 00:00")
         self.rec_clock_timer.start(200)
 
@@ -890,6 +1174,7 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         self.btn_stop_rec.setEnabled(False)
         self.combo_format.setEnabled(True)
         self.spin_record_fps.setEnabled(True)
+        self.btn_events.setEnabled(False)
         self.lbl_rec_status.setText("Not recording")
 
     def update_recording_availability(self):
@@ -934,8 +1219,30 @@ class BehaviorRecording(QtWidgets.QMainWindow):
             duration = 0.0
             avg_rate = 0.0
 
+        # Build one independent 0/1 column per event type (Sound, Light,
+        # Shock, Trigger1, Trigger2, Manual) instead of a single
+        # categorical column. This is what lets simultaneous events (e.g.
+        # Sound and Light onset at the same instant) both be flagged on
+        # the same sample without one overwriting the other.
+        #
+        # Each column still uses nearest-neighbor matching against the
+        # sample timestamps, since an event lands at an arbitrary time
+        # between two samples, not exactly on one.
+        sample_times = [t for t, _ in self.signal_log_rows]
+        event_columns = {code: [0] * n for code in EVENT_COLUMNS}
+        for et, code in self.event_times_rec:
+            if not sample_times:
+                break
+            nearest_idx = min(
+                range(len(sample_times)),
+                key=lambda i: abs(sample_times[i] - et))
+            event_columns.setdefault(code, [0] * n)[nearest_idx] = 1
+
         filename = f"LoadCell1_{self.session_timestamp}.csv"
         filepath = os.path.join(self.output_dir, filename)
+
+        col_codes = list(EVENT_COLUMNS.keys())
+        col_header = ",".join(EVENT_COLUMNS[c] for c in col_codes)
 
         try:
             with open(filepath, "w") as f:
@@ -949,9 +1256,11 @@ class BehaviorRecording(QtWidgets.QMainWindow):
                 f.write(f"# Samples: {n}\n")
                 f.write(f"# Duration (s): {duration:.3f}\n")
                 f.write(f"# Average sample rate (Hz): {avg_rate:.2f}\n")
-                f.write("Time (s),Value\n")
-                for t, v in self.signal_log_rows:
-                    f.write(f"{t:.4f},{v:.6g}\n")
+                f.write(f"# Events marked: {len(self.event_times_rec)}\n")
+                f.write(f"Time (s),Value,{col_header}\n")
+                for i, (t, v) in enumerate(self.signal_log_rows):
+                    flags = ",".join(str(event_columns[c][i]) for c in col_codes)
+                    f.write(f"{t:.4f},{v:.6g},{flags}\n")
         except Exception as e:
             QtWidgets.QMessageBox.warning(
                 self, "Signal Log Error",
