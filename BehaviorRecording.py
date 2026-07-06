@@ -122,11 +122,13 @@ BG        = "#141414"
 BG_PANEL  = "#141414"
 TEXT      = "#c8c8c8"
 BORDER    = "#2a2a2a"
+DIM       = "#666666"
 
 GLOBAL_STYLESHEET = f"""
     QMainWindow, QWidget {{ background: {BG}; color: {TEXT}; }}
     QGroupBox {{ background: {BG_PANEL}; border: 1px solid {BORDER}; }}
     QGroupBox::title {{ color: {TEXT}; }}
+    QPushButton:disabled {{ color: {DIM}; border-color: {BORDER}; }}
 """
 
 # Cameras
@@ -998,6 +1000,13 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         (self.record_start_time) to log against.
         """
         if not self.is_recording or self.record_start_time is None:
+            # Give explicit feedback instead of silently doing nothing —
+            # this is the manual "Events" button's own click path (code
+            # defaults to 6), so a status message here is meaningful;
+            # external callers (e.g. Conditioning Setup) get the same
+            # message reflected in this window's status label.
+            self.lbl_signal_status.setText(
+                "Status: event ignored — not currently recording")
             return
 
         color = EVENT_COLORS.get(code, (150, 150, 150, 150))
