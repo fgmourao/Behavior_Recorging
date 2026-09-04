@@ -5,12 +5,6 @@ Multi-camera video acquisition end load cell recording for behavioral analysis.
 
 ---
 
-## License
-
-Documentation licensed under Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0).
-
----
-
 ## Author
 
 **v1.0 (2026)**
