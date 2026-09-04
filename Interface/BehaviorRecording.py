@@ -71,6 +71,26 @@ FEATURES:
       dependent — some cameras or backends (notably AVFoundation on
       macOS) silently ignore brightness/contrast/sharpness; resolution
       tends to be the most reliably supported of the four.
+    - Signal displayed and logged in millivolts (mV), not raw ADC
+      counts: converted per the HX711 datasheet's own full-scale
+      formula, so the value represents the load cell's actual
+      differential output voltage (at its E+/E- terminals) — a
+      property of the sensor/electronics, independent of any
+      grams calibration. See counts_to_mv() / AVDD_VOLTS below.
+    - Gain control: a Gain combo (128 default / 64) sends a serial
+      command to the Arduino to change the HX711's Channel A PGA gain
+      at runtime, re-taring automatically afterward (the zero-offset is
+      gain-dependent). Only 128/64 are offered — 32 belongs to Channel
+      B, a separate physical input not wired in this design.
+    - Real-time signal processing: an optional High-pass -> Low-pass ->
+      Moving-average chain (each stage independently toggleable) is
+      applied to the raw signal as it streams in, producing a
+      "Processed" value plotted as a second curve and saved as its own
+      CSV column, alongside the always-unfiltered raw "Value (mV)"
+      column. This is CAUSAL (real-time) filtering, not the zero-phase
+      filtfilt used for offline MATLAB analysis, so it has some phase
+      delay — use the raw column, not the processed one, for precise
+      event-timing analysis.
 
 PLANNED (not yet implemented):
     - A second, third, and fourth independent signal channel (multiple
@@ -96,7 +116,7 @@ WORKFLOW:
 
 REQUIREMENTS:
     Python >= 3.8
-    PyQt5, pyqtgraph, opencv-python, numpy, pyserial
+    PyQt5, pyqtgraph, opencv-python, numpy, pyserial, scipy
 
 AUTHOR:
     Flavio Mourao (mourao.fg@gmail.com)
@@ -116,6 +136,7 @@ import serial
 import serial.tools.list_ports
 import pyqtgraph as pg
 from PyQt5 import QtWidgets, QtCore, QtGui
+from scipy.signal import butter, sosfilt, sosfilt_zi
 
 # Theme
 BG        = "#141414"
@@ -126,8 +147,13 @@ DIM       = "#666666"
 
 GLOBAL_STYLESHEET = f"""
     QMainWindow, QWidget {{ background: {BG}; color: {TEXT}; }}
-    QGroupBox {{ background: {BG_PANEL}; border: 1px solid {BORDER}; }}
-    QGroupBox::title {{ color: {TEXT}; }}
+    QGroupBox {{ background: {BG_PANEL}; border: 1px solid {BORDER}; margin-top: 10px; }}
+    QGroupBox::title {{
+        color: {TEXT};
+        subcontrol-origin: margin;
+        subcontrol-position: top left;
+        padding: 0 4px;
+    }}
     QPushButton:disabled {{ color: {DIM}; border-color: {BORDER}; }}
 """
 
@@ -175,6 +201,117 @@ EVENT_COLUMNS = {
     5: "Trigger2",
     6: "Manual",
 }
+
+# =============================================================================
+# HX711 -> VOLTAGE CONVERSION
+# Converts raw ADC counts to the load cell's actual differential output
+# voltage (millivolts, at its E+/E- terminals), per the HX711 datasheet's
+# own full-scale-range formula:
+#     full_scale_V = 0.5 * (AVDD_VOLTS / gain)
+#     counts_to_mV = (full_scale_V / 2**23) * 1000
+#
+# This characterizes the ELECTRICAL signal itself -- a property of the
+# sensor/ADC/gain setting, independent of which load cell is attached or
+# how it's calibrated in grams. Useful for studying electrical noise in
+# an absolute, comparable-across-setups unit.
+#
+# The conversion depends on gain, which can now change at runtime (see
+# Settings > Video... sibling control, the Gain combo in the signal
+# panel) -- counts_to_mV(gain) recomputes it accordingly. Only 128 and
+# 64 are ever passed in: those are HX711 Channel A's two gain options
+# (matching this design's A+/A- wiring). Gain 32 belongs to Channel B --
+# a SEPARATE physical input, not wired here -- so it is deliberately
+# never offered; selecting it would silently read an unconnected input,
+# not "the same signal at lower gain".
+#
+# ASSUMPTIONS -- adjust to match your actual hardware:
+#   AVDD_VOLTS -- the HX711's actual regulated excitation voltage. 5.0V
+#                 is the datasheet's reference value, but many modules
+#                 regulate slightly lower in practice (commonly closer
+#                 to ~4.3V). For best accuracy, measure the AVDD pin
+#                 directly with a multimeter and update this value --
+#                 it directly scales every mV value this app shows/saves.
+# =============================================================================
+HX711_GAIN_DEFAULT = 128
+AVDD_VOLTS          = 5.0
+
+# HX711 RATE pin is a hardware jumper on this board (80 SPS "shorted",
+# 10 SPS otherwise) -- not software-controllable, so this is fixed here
+# to match. Used only to DESIGN the real-time filters below (their
+# cutoff-to-Nyquist ratio depends on it); it is NOT used to change the
+# actual acquisition rate.
+NOMINAL_SAMPLE_RATE_HZ = 80.0
+
+
+def counts_to_mv(gain):
+    """mV per raw ADC count, for the given HX711 Channel A gain (128 or 64)."""
+    full_scale_v = 0.5 * (AVDD_VOLTS / gain)
+    return (full_scale_v / (2 ** 23)) * 1000.0
+
+
+# Fixed Y-axis display units for the live plot. Everything is always
+# stored/logged internally (and in the CSV) in mV regardless of this
+# setting -- these only rescale what's DRAWN, replacing pyqtgraph's
+# automatic SI-prefix axis scaling (which was producing a confusing
+# stacked-unit label, e.g. "mmV", with a "(x10^-3)"-style multiplier).
+DISPLAY_UNIT_SCALES = {
+    "mV": 1.0,
+    "\u00b5V": 1000.0,   # microvolts
+    "V":  0.001,
+}
+
+
+class RealtimeFilter:
+    """
+    A causal (real-time-safe) IIR Butterworth filter, processed one
+    sample at a time using scipy's second-order-sections form with
+    persistent state (zi) carried across calls -- this statefulness is
+    what makes it usable in a live stream at all, unlike MATLAB's
+    filtfilt (zero-phase, but requires the entire signal already in
+    memory to run both forward and backward).
+
+    TRADE-OFF: a causal filter has real phase delay (the filtered
+    output lags the true input by some amount that depends on filter
+    order and how close the signal is to the cutoff frequency -- see
+    the discussion in chat for estimated numbers, roughly ~15-30ms per
+    low-pass stage at order 1-2, less for a high-pass well above its
+    own cutoff). filtfilt, used for all the offline MATLAB analysis,
+    has none. This is an inherent property of real-time filtering, not
+    a bug -- there is no such thing as a zero-phase live filter.
+    """
+    def __init__(self, kind, cutoff_hz, fs_hz, order=2):
+        """kind: 'highpass' or 'lowpass'."""
+        self.kind      = kind
+        self.cutoff_hz = cutoff_hz
+        self.fs_hz     = fs_hz
+        self.order     = order
+        self._design()
+
+    def _design(self):
+        nyquist    = self.fs_hz / 2.0
+        normalized = min(max(self.cutoff_hz / nyquist, 1e-6), 0.999)
+        self.sos = butter(self.order, normalized, btype=self.kind, output='sos')
+        self.zi  = sosfilt_zi(self.sos)
+        self._initialized = False
+
+    def reset(self):
+        """Clears the filter's internal state -- call this on a fresh
+        connection, or whenever cutoff/order changes, so stale history
+        from a previous signal doesn't bleed into new samples."""
+        self.zi = sosfilt_zi(self.sos)
+        self._initialized = False
+
+    def process(self, x):
+        """Filters a single new sample and returns the filtered value."""
+        if not self._initialized:
+            # Prime the filter's initial state to the first sample's own
+            # level, rather than zero -- avoids a startup ramp transient
+            # that a causal filter would otherwise show for the first
+            # several samples after connecting.
+            self.zi = self.zi * x
+            self._initialized = True
+        y, self.zi = sosfilt(self.sos, [x], zi=self.zi)
+        return float(y[0])
 
 
 class CameraWorker(QtCore.QThread):
@@ -277,8 +414,13 @@ class SerialWorker(QtCore.QThread):
     "requested" in the firmware (e.g. an HX711 load-cell amplifier in
     its default configuration converts at ~10 samples/sec natively,
     regardless of how often the sketch checks for new data).
+
+    NOTE: the value emitted here is the RAW ADC count from the Arduino
+    (as printed by the sketch) -- the mV conversion happens in the main
+    window's on_sample_ready(), not here, keeping this class focused
+    purely on serial I/O.
     """
-    sample_ready = QtCore.pyqtSignal(float, float)   # elapsed seconds, value
+    sample_ready = QtCore.pyqtSignal(float, float)   # elapsed seconds, raw ADC count
     error        = QtCore.pyqtSignal(str)
     connected    = QtCore.pyqtSignal()
 
@@ -336,6 +478,26 @@ class SerialWorker(QtCore.QThread):
                     self._ser.write(b't')
                 except Exception:
                     pass
+
+    def send_gain(self, gain):
+        """
+        Send the gain-change command to the Arduino: 'h' for 128
+        (Channel A, default/"high"), 'm' for 64 (Channel A, "medium").
+        Gain 32 (Channel B) is never sent -- that's a separate physical
+        input not wired in this design. The firmware re-tares
+        automatically after changing gain, since the zero-offset is
+        gain-dependent.
+        """
+        if self._ser is None or not self._ser.is_open:
+            return
+        command = {128: b'h', 64: b'm'}.get(gain)
+        if command is None:
+            return
+        with self._write_lock:
+            try:
+                self._ser.write(command)
+            except Exception:
+                pass
 
     def stop(self):
         """Ask the run() loop to exit; it closes the port on its way out."""
@@ -454,7 +616,7 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         self.output_dir     = None
         self.record_start_time = None
         self.session_timestamp = None   # shared across video files + signal log, per session
-        self.signal_log_rows   = []     # (elapsed_s_since_record_start, value), logged while recording
+        self.signal_log_rows   = []     # (elapsed_s_since_record_start, raw_mV, processed_mV), logged while recording
         self.event_times_rec   = []     # (elapsed_s_since_record_start, code) per mark_event() call -- own vs external
         self.event_lines       = []     # pg.InfiniteLine items drawn on the live plot for each Events click
 
@@ -464,8 +626,27 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         self.serial_worker      = None
         self.is_signal_connected = False
         self.signal_time  = []   # elapsed seconds since connection, per sample (for the live plot)
-        self.signal_value = []   # display value per sample (raw, or smoothed if enabled)
-        self.smooth_deque = deque(maxlen=5)   # rolling buffer for the optional moving average
+        self.signal_value = []   # display value per sample, in mV (raw, or smoothed if enabled)
+        self.display_scale = 1000.0   # multiplies mV for the PLOT only; default unit = uV
+        self.display_unit  = "\u00b5V"
+        self.smooth_deque = deque(maxlen=5)   # rolling buffer for the optional DISPLAY-ONLY moving average
+
+        # -- HX711 gain (Channel A: 128 or 64 only -- see counts_to_mv() note) --
+        self.current_gain        = HX711_GAIN_DEFAULT
+        self.counts_to_mv_factor = counts_to_mv(self.current_gain)
+
+        # -- Real-time signal processing chain: High-pass -> Low-pass ->
+        # Moving average, each stage independently toggleable. Unlike
+        # smooth_deque above (display-only), this chain's output IS
+        # saved -- as a "Processed (mV)" column alongside the raw
+        # "Value (mV)" column -- and is also drawn as a second curve on
+        # the live plot. Causal (real phase delay), not zero-phase --
+        # see RealtimeFilter's docstring. Filter objects are built lazily
+        # in rebuild_processing_chain(), called once controls exist.
+        self.hp_filter = None
+        self.lp_filter = None
+        self.proc_ma_deque = deque(maxlen=5)
+        self.signal_processed_value = []   # mirrors signal_value, but processed
 
         self.setup_gui()
 
@@ -479,6 +660,15 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         action_video = QtWidgets.QAction("Video...", self)
         action_video.triggered.connect(self.open_video_settings)
         settings_menu.addAction(action_video)
+
+        # Analysis menu: live tools kept in separate module files (not
+        # written into this one) so this file doesn't keep growing --
+        # each is imported lazily, on first use, from the same folder.
+        analysis_menu = menubar.addMenu("Analysis")
+        action_fft = QtWidgets.QAction("FFT...", self)
+        action_fft.triggered.connect(self.open_fft_analysis)
+        analysis_menu.addAction(action_fft)
+        self.fft_window = None   # created on first use; reused afterward
 
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
@@ -549,9 +739,26 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         self.plot_signal = pg.PlotWidget(title="")
         self.plot_signal.setBackground('#141414')
         self.plot_signal.setLabel('bottom', 'Time', 's')
+        # NOTE: pyqtgraph auto-applies its own SI-prefix scaling when a
+        # "units" string is passed as the 3rd argument here, and expects
+        # a BASE unit (e.g. "V") to do that -- passing an already-prefixed
+        # unit like "mV" makes it stack another prefix on top (producing
+        # a nonsensical "mmV" label and multiplying the displayed axis
+        # values by 1000). Embedding "(mV)" directly in the text instead
+        # disables that auto-scaling, so the axis shows the real mV values.
+        self.plot_signal.setLabel('left', 'Signal (\u00b5V)')
+        # pyqtgraph's Y axis auto-applies its own SI-prefix scaling
+        # (e.g. showing "(x0.001)" next to the label) based on the data
+        # range, REGARDLESS of what text/units we pass to setLabel above
+        # -- it's a separate feature of the axis itself. Disabling it
+        # here is what actually stops that confusing multiplier
+        # annotation from appearing; changing the label text alone
+        # (as tried before) does not.
+        self.plot_signal.getAxis('left').enableAutoSIPrefix(False)
         #self.curve_signal = self.plot_signal.plot(pen=pg.mkPen('#0072BD', width=2)) # BLUE
         #self.curve_signal = self.plot_signal.plot(pen=pg.mkPen('#D95319', width=2)) # ORANGE
-        self.curve_signal = self.plot_signal.plot(pen=pg.mkPen('#c22017', width=2)) # RED
+        self.curve_signal = self.plot_signal.plot(pen=pg.mkPen('#c22017', width=2)) # RED (raw)
+        self.curve_processed = self.plot_signal.plot(pen=pg.mkPen('#44aaff', width=2))  # BLUE (processed)
         
         # -- Display mode: scrolling window vs. full growing history --
         display_layout = QtWidgets.QHBoxLayout()
@@ -566,6 +773,31 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         self.spin_window_seconds.setRange(1, 300)
         self.spin_window_seconds.setValue(10)
         display_layout.addWidget(self.spin_window_seconds)
+
+        # -- Fixed Y-axis unit: replaces pyqtgraph's automatic SI-prefix
+        #    scaling (which produced a confusing stacked-unit label) with
+        #    an explicit choice. Internally always mV; this only rescales
+        #    what's drawn on the plot. --
+        display_layout.addWidget(QtWidgets.QLabel("Y unit:"))
+        self.combo_display_unit = QtWidgets.QComboBox()
+        self.combo_display_unit.addItems(list(DISPLAY_UNIT_SCALES.keys()))
+        self.combo_display_unit.setCurrentText("\u00b5V")
+        self.combo_display_unit.currentTextChanged.connect(self.on_display_unit_changed)
+        display_layout.addWidget(self.combo_display_unit)
+
+        # -- Curve visibility: colors are always fixed (raw=red,
+        #    processed=blue) -- but when no processing stage is active,
+        #    the processed curve is IDENTICAL to the raw one and, being
+        #    drawn on top, visually hides it (looks like "everything
+        #    turned blue", though the red curve is still there underneath
+        #    unchanged). This selector lets you show just one at a time
+        #    to avoid that overlap confusion, or both together. --
+        display_layout.addWidget(QtWidgets.QLabel("Show:"))
+        self.combo_curve_visibility = QtWidgets.QComboBox()
+        self.combo_curve_visibility.addItems(["Both", "Raw only", "Processed only"])
+        self.combo_curve_visibility.currentTextChanged.connect(self.on_curve_visibility_changed)
+        display_layout.addWidget(self.combo_curve_visibility)
+
         display_layout.addStretch()
 
         # -- Optional smoothing: affects the LIVE PLOT only. The raw,
@@ -607,10 +839,11 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         self.combo_baud = QtWidgets.QComboBox()
         self.combo_baud.addItems(["9600", "19200", "38400", "57600", "115200"])
         self.combo_baud.setCurrentText("115200")   # matches the Arduino sketch
+        self.combo_baud.setMinimumWidth(80)
         port_layout.addWidget(self.combo_baud)
         port_layout.addStretch()
 
-        # -- Tare / Events --
+        # -- Tare / Events / Gain --
         tare_layout = QtWidgets.QHBoxLayout()
         self.btn_tare = QtWidgets.QPushButton("Tare")
         self.btn_tare.clicked.connect(self.tare_signal)
@@ -625,15 +858,72 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         self.btn_events.clicked.connect(lambda checked=False: self.mark_event(6))
         self.btn_events.setEnabled(False)
         tare_layout.addWidget(self.btn_events)
+
+        tare_layout.addWidget(QtWidgets.QLabel("Gain:"))
+        self.combo_gain = QtWidgets.QComboBox()
+        self.combo_gain.addItems(["128 (default)", "64"])
+        self.combo_gain.setToolTip(
+            "HX711 Channel A gain. Only 128/64 are offered -- gain 32 is "
+            "Channel B, a separate physical input not wired in this "
+            "design. Changing gain re-tares automatically on the Arduino.")
+        self.combo_gain.setEnabled(False)
+        self.combo_gain.currentIndexChanged.connect(self.on_gain_changed)
+        tare_layout.addWidget(self.combo_gain)
         tare_layout.addStretch()
+
+        # -- Real-time signal processing chain: High-pass -> Low-pass ->
+        # Moving average. Each stage is independently toggleable and
+        # feeds a SEPARATE "Processed (mV)" column in the CSV (the raw
+        # "Value (mV)" column is always saved unfiltered, regardless of
+        # these settings) plus a second curve on the live plot. This is
+        # causal/real-time filtering (not zero-phase like the offline
+        # MATLAB filtfilt analysis), so it introduces some phase delay --
+        # see RealtimeFilter's docstring for estimated magnitudes.
+        proc_group  = QtWidgets.QGroupBox("Signal Processing (saved as 'Processed')")
+        proc_layout = QtWidgets.QHBoxLayout()
+
+        self.chk_hp = QtWidgets.QCheckBox("High-pass")
+        self.chk_hp.stateChanged.connect(self.rebuild_processing_chain)
+        proc_layout.addWidget(self.chk_hp)
+        self.spin_hp_cutoff = QtWidgets.QDoubleSpinBox()
+        self.spin_hp_cutoff.setRange(0.01, 30.0)
+        self.spin_hp_cutoff.setValue(0.5)
+        self.spin_hp_cutoff.setSuffix(" Hz")
+        self.spin_hp_cutoff.valueChanged.connect(self.rebuild_processing_chain)
+        proc_layout.addWidget(self.spin_hp_cutoff)
+
+        self.chk_lp = QtWidgets.QCheckBox("Low-pass")
+        self.chk_lp.stateChanged.connect(self.rebuild_processing_chain)
+        proc_layout.addWidget(self.chk_lp)
+        self.spin_lp_cutoff = QtWidgets.QDoubleSpinBox()
+        self.spin_lp_cutoff.setRange(0.5, 40.0)
+        self.spin_lp_cutoff.setValue(10.0)
+        self.spin_lp_cutoff.setSuffix(" Hz")
+        self.spin_lp_cutoff.valueChanged.connect(self.rebuild_processing_chain)
+        proc_layout.addWidget(self.spin_lp_cutoff)
+
+        self.chk_proc_ma = QtWidgets.QCheckBox("Moving avg.")
+        self.chk_proc_ma.stateChanged.connect(self.rebuild_processing_chain)
+        proc_layout.addWidget(self.chk_proc_ma)
+        self.spin_proc_ma_window = QtWidgets.QSpinBox()
+        self.spin_proc_ma_window.setRange(2, 100)
+        self.spin_proc_ma_window.setValue(5)
+        self.spin_proc_ma_window.setSuffix(" samples")
+        self.spin_proc_ma_window.valueChanged.connect(self.rebuild_processing_chain)
+        proc_layout.addWidget(self.spin_proc_ma_window)
+
+        proc_layout.addStretch()
+        proc_group.setLayout(proc_layout)
 
         self.lbl_signal_status = QtWidgets.QLabel("Status: idle")
 
         plot_layout.addWidget(self.plot_signal, 1)
         plot_layout.addLayout(display_layout)
         plot_layout.addLayout(smooth_layout)
-        plot_layout.addLayout(port_layout)
+        plot_layout.addSpacing(12)
+        plot_layout.addWidget(proc_group)
         plot_layout.addLayout(tare_layout)
+        plot_layout.addLayout(port_layout)
         plot_layout.addWidget(self.lbl_signal_status)
         plot_group.setLayout(plot_layout)
 
@@ -750,6 +1040,29 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         dialog = VideoSettingsDialog(self, parent=self)
         dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
         dialog.show()
+
+    def open_fft_analysis(self):
+        """
+        Analysis > FFT... — opens the live PSD viewer, implemented in
+        the separate fft_analysis.py module (kept in the same folder).
+        Reuses the same window instance on subsequent clicks rather than
+        creating a new one each time, just raising/focusing it if it's
+        already open.
+        """
+        try:
+            from fft_analysis import FFTAnalysisWindow
+        except ImportError:
+            QtWidgets.QMessageBox.warning(
+                self, "FFT Analysis Not Found",
+                "fft_analysis.py was not found alongside this script.\n\n"
+                "Place both files in the same folder to enable this feature.")
+            return
+
+        if self.fft_window is None:
+            self.fft_window = FFTAnalysisWindow(self, parent=self)
+        self.fft_window.show()
+        self.fft_window.raise_()
+        self.fft_window.activateWindow()
 
     # ---------------------------------------------------------------
     # CAMERA CONTROL
@@ -927,8 +1240,21 @@ class BehaviorRecording(QtWidgets.QMainWindow):
 
         self.signal_time  = []
         self.signal_value = []
+        self.signal_processed_value = []
         self.smooth_deque.clear()
         self.curve_signal.setData([], [])
+        self.curve_processed.setData([], [])
+
+        # Gain resets to the Arduino's own default (128) on every power-up
+        # / reconnect, since the firmware always starts at gain=128 in
+        # setup() -- keep the combo and our own tracked gain in sync.
+        self.current_gain        = HX711_GAIN_DEFAULT
+        self.counts_to_mv_factor = counts_to_mv(self.current_gain)
+        self.combo_gain.blockSignals(True)
+        self.combo_gain.setCurrentIndex(0)
+        self.combo_gain.blockSignals(False)
+
+        self.rebuild_processing_chain()
 
         # Clear any event markers drawn during a previous connection.
         for line in self.event_lines:
@@ -945,6 +1271,7 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         self.is_signal_connected = True
         self.btn_conn_toggle.setText("Disconnect")
         self.btn_tare.setEnabled(True)
+        self.combo_gain.setEnabled(True)
         self.combo_serial_port.setEnabled(False)
         self.combo_baud.setEnabled(False)
         self.update_recording_availability()
@@ -966,10 +1293,52 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         self.is_signal_connected = False
         self.btn_conn_toggle.setText("Connect")
         self.btn_tare.setEnabled(False)
+        self.combo_gain.setEnabled(False)
         self.combo_serial_port.setEnabled(True)
         self.combo_baud.setEnabled(True)
         self.update_recording_availability()
         self.lbl_signal_status.setText("Status: idle")
+
+    def on_gain_changed(self):
+        """
+        Sends the gain-change command to the Arduino (128 or 64 only --
+        see combo_gain's tooltip) and updates the mV conversion factor to
+        match. The firmware re-tares automatically after a gain change,
+        so the signal will jump momentarily as the new zero settles --
+        this is expected, not an error.
+        """
+        gain = 128 if self.combo_gain.currentIndex() == 0 else 64
+        self.current_gain        = gain
+        self.counts_to_mv_factor = counts_to_mv(gain)
+        if self.serial_worker is not None:
+            self.serial_worker.send_gain(gain)
+        self.lbl_signal_status.setText(f"Status: gain set to {gain} (re-taring on device)")
+
+    def rebuild_processing_chain(self):
+        """
+        (Re)builds the High-pass/Low-pass filter objects to match the
+        current checkbox/cutoff settings, and resets the moving-average
+        buffer -- called on any change to the processing controls, and
+        once at connect time. Resetting on any parameter change avoids
+        mixing filter state computed under old settings into new output.
+        """
+        if self.chk_hp.isChecked():
+            self.hp_filter = RealtimeFilter(
+                'highpass', self.spin_hp_cutoff.value(), NOMINAL_SAMPLE_RATE_HZ)
+        else:
+            self.hp_filter = None
+
+        if self.chk_lp.isChecked():
+            self.lp_filter = RealtimeFilter(
+                'lowpass', self.spin_lp_cutoff.value(), NOMINAL_SAMPLE_RATE_HZ)
+        else:
+            self.lp_filter = None
+
+        self.spin_hp_cutoff.setEnabled(self.chk_hp.isChecked())
+        self.spin_lp_cutoff.setEnabled(self.chk_lp.isChecked())
+        self.spin_proc_ma_window.setEnabled(self.chk_proc_ma.isChecked())
+
+        self.proc_ma_deque = deque(maxlen=self.spin_proc_ma_window.value())
 
     def tare_signal(self):
         if self.serial_worker is not None:
@@ -1031,39 +1400,62 @@ class BehaviorRecording(QtWidgets.QMainWindow):
             f"Status: connected — event marked ({label}, "
             f"{len(self.event_times_rec)} total)")
 
-    def on_sample_ready(self, t, value):
-        """Slot: runs on the main thread. Appends the new sample and
-        refreshes the plot according to the selected display mode.
+    def on_sample_ready(self, t, raw_count):
+        """Slot: runs on the main thread. Converts the raw ADC count to
+        millivolts (using the CURRENT gain's factor -- see
+        counts_to_mv()), appends the new sample, runs the optional
+        real-time processing chain (High-pass -> Low-pass -> Moving
+        average), and refreshes both plot curves.
 
-        IMPORTANT: smoothing (if enabled) is applied only to the value
-        stored for the live plot. The value logged for recording
-        (signal_log_rows, below) always uses the raw, unaveraged `value`
-        — smoothing never touches the saved data.
+        IMPORTANT: the display-only smoothing (chk_smooth) affects only
+        the RAW curve's on-screen value, same as before -- it never
+        touches saved data. The separate processing chain (chk_hp/
+        chk_lp/chk_proc_ma) runs on the raw mV value and produces the
+        "Processed" value that DOES get saved (signal_log_rows) and
+        plotted as the second (blue) curve.
         """
-        display_value = value
+        value_mV = raw_count * self.counts_to_mv_factor
+
+        display_value = value_mV
         if self.chk_smooth.isChecked():
-            self.smooth_deque.append(value)
+            self.smooth_deque.append(value_mV)
             display_value = sum(self.smooth_deque) / len(self.smooth_deque)
+
+        # -- Real-time processing chain: High-pass -> Low-pass -> Moving average --
+        processed_value = value_mV
+        if self.hp_filter is not None:
+            processed_value = self.hp_filter.process(processed_value)
+        if self.lp_filter is not None:
+            processed_value = self.lp_filter.process(processed_value)
+        if self.chk_proc_ma.isChecked():
+            self.proc_ma_deque.append(processed_value)
+            processed_value = sum(self.proc_ma_deque) / len(self.proc_ma_deque)
 
         self.signal_time.append(t)
         self.signal_value.append(display_value)
+        self.signal_processed_value.append(processed_value)
 
         # If a recording session is active, also log this sample with a
         # timestamp relative to the SAME start time used for video frame
         # pacing (self.record_start_time) — this is what keeps the load
-        # cell log synchronized with the recorded video files. Always the
-        # raw value, regardless of the live-plot smoothing setting above.
+        # cell log synchronized with the recorded video files. Raw
+        # (unsmoothed) mV value AND the processed value are both saved,
+        # regardless of the live-plot smoothing setting above.
         if self.is_recording and self.record_start_time is not None:
             elapsed_rec = time.perf_counter() - self.record_start_time
-            self.signal_log_rows.append((elapsed_rec, value))
+            self.signal_log_rows.append((elapsed_rec, value_mV, processed_value))
 
         # Soft cap so a very long session doesn't grow memory forever.
         max_points = 20000
         if len(self.signal_time) > max_points:
-            self.signal_time  = self.signal_time[-max_points:]
-            self.signal_value = self.signal_value[-max_points:]
+            self.signal_time            = self.signal_time[-max_points:]
+            self.signal_value           = self.signal_value[-max_points:]
+            self.signal_processed_value = self.signal_processed_value[-max_points:]
 
-        self.curve_signal.setData(self.signal_time, self.signal_value)
+        self.curve_signal.setData(
+            self.signal_time, np.array(self.signal_value) * self.display_scale)
+        self.curve_processed.setData(
+            self.signal_time, np.array(self.signal_processed_value) * self.display_scale)
 
         if self.combo_display_mode.currentIndex() == 0:   # Scrolling window
             window = self.spin_window_seconds.value()
@@ -1071,8 +1463,10 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         else:                                              # Full history
             self.plot_signal.setXRange(0, max(t, 1), padding=0.02)
 
+        last_display = value_mV * self.display_scale
         self.lbl_signal_status.setText(
-            f"Status: connected — {len(self.signal_time)} samples, last={value:.0f}")
+            f"Status: connected — {len(self.signal_time)} samples, "
+            f"last={last_display:.6g} {self.display_unit}")
 
     def on_signal_error(self, message):
         QtWidgets.QMessageBox.warning(self, "Signal Connection Error", message)
@@ -1083,6 +1477,40 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         size, so keep that control's enabled state in sync."""
         self.spin_window_seconds.setEnabled(
             self.combo_display_mode.currentIndex() == 0)
+
+    def on_display_unit_changed(self, unit_text):
+        """
+        Changes the FIXED Y-axis display unit/scale for the live plot
+        (mV, uV, or V) -- this replaces pyqtgraph's automatic SI-prefix
+        axis scaling, which was stacking an extra prefix on top of "mV"
+        and showing a confusing multiplier. self.signal_value is always
+        stored in mV regardless of this choice; only what's DRAWN (and
+        this status label) is rescaled -- the saved CSV is never
+        affected, same principle as the smoothing option above.
+        """
+        self.display_scale = DISPLAY_UNIT_SCALES.get(unit_text, 1.0)
+        self.display_unit  = unit_text
+        self.plot_signal.setLabel('left', f'Signal ({unit_text})')
+
+        if self.signal_time:
+            scaled = np.array(self.signal_value) * self.display_scale
+            self.curve_signal.setData(self.signal_time, scaled)
+            scaled_proc = np.array(self.signal_processed_value) * self.display_scale
+            self.curve_processed.setData(self.signal_time, scaled_proc)
+
+    def on_curve_visibility_changed(self, choice_text):
+        """
+        Shows/hides the raw (red) and processed (blue) curves per the
+        "Show:" combo. Colors are always fixed regardless of this choice
+        -- raw is always red, processed is always blue -- this only
+        controls which of them are currently drawn, so an identical
+        processed-equals-raw overlap (when no processing stage is
+        active) doesn't visually read as "the curve changed color".
+        """
+        show_raw       = choice_text in ("Both", "Raw only")
+        show_processed = choice_text in ("Both", "Processed only")
+        self.curve_signal.setVisible(show_raw)
+        self.curve_processed.setVisible(show_processed)
 
     def on_smoothing_changed(self):
         """
@@ -1156,7 +1584,7 @@ class BehaviorRecording(QtWidgets.QMainWindow):
 
         self.video_writers   = {}   # opened lazily per camera, on its first frame
         self.frames_written  = {}   # camera index -> frames written so far
-        self.signal_log_rows = []   # (elapsed_s, value) logged by on_sample_ready()
+        self.signal_log_rows = []   # (elapsed_s, value_mV) logged by on_sample_ready()
         self.event_times_rec = []   # reset for this session's own elapsed_rec clock
         self.is_recording     = True
         self.record_start_time = time.perf_counter()
@@ -1211,6 +1639,23 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         Timestamps are seconds elapsed since self.record_start_time —
         the SAME zero-point used for the video files' frame pacing — so
         this file is directly synchronized with the recorded videos.
+
+        Two signal columns are written:
+          Value (mV)     -- ALWAYS the raw, unfiltered mV-converted
+                             signal (per the current HX711 gain -- see
+                             counts_to_mv()). This is the reference
+                             column for any precise timing/synchrony
+                             analysis (e.g. aligning to Conditioning
+                             Setup's stimulus event markers).
+          Processed (mV) -- the same signal after the real-time
+                             High-pass/Low-pass/Moving-average chain
+                             (whichever stages were enabled -- see the
+                             header comment below for exactly which).
+                             This is CAUSAL filtering (real phase delay,
+                             unlike MATLAB's zero-phase filtfilt used for
+                             offline analysis) -- good for inspecting
+                             signal dynamics, not for precise event
+                             timing.
         """
         if not self.output_dir or self.session_timestamp is None:
             return
@@ -1237,7 +1682,7 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         # Each column still uses nearest-neighbor matching against the
         # sample timestamps, since an event lands at an arbitrary time
         # between two samples, not exactly on one.
-        sample_times = [t for t, _ in self.signal_log_rows]
+        sample_times = [row[0] for row in self.signal_log_rows]
         event_columns = {code: [0] * n for code in EVENT_COLUMNS}
         for et, code in self.event_times_rec:
             if not sample_times:
@@ -1253,6 +1698,18 @@ class BehaviorRecording(QtWidgets.QMainWindow):
         col_codes = list(EVENT_COLUMNS.keys())
         col_header = ",".join(EVENT_COLUMNS[c] for c in col_codes)
 
+        # Describe exactly which processing stages were active, so the
+        # "Processed" column is reproducible/interpretable later without
+        # having to guess the settings used at the time.
+        proc_parts = []
+        if self.chk_hp.isChecked():
+            proc_parts.append(f"high-pass {self.spin_hp_cutoff.value():.2f}Hz")
+        if self.chk_lp.isChecked():
+            proc_parts.append(f"low-pass {self.spin_lp_cutoff.value():.2f}Hz")
+        if self.chk_proc_ma.isChecked():
+            proc_parts.append(f"moving-avg {self.spin_proc_ma_window.value()} samples")
+        proc_desc = " -> ".join(proc_parts) if proc_parts else "none (passthrough of raw)"
+
         try:
             with open(filepath, "w") as f:
                 f.write("# Behavior Recording - Load Cell Log\n")
@@ -1266,10 +1723,15 @@ class BehaviorRecording(QtWidgets.QMainWindow):
                 f.write(f"# Duration (s): {duration:.3f}\n")
                 f.write(f"# Average sample rate (Hz): {avg_rate:.2f}\n")
                 f.write(f"# Events marked: {len(self.event_times_rec)}\n")
-                f.write(f"Time (s),Value,{col_header}\n")
-                for i, (t, v) in enumerate(self.signal_log_rows):
+                f.write(f"# Value (mV) units: HX711 Channel A gain={self.current_gain}, "
+                        f"assumed AVDD={AVDD_VOLTS}V, {self.counts_to_mv_factor:.9g} mV/count. "
+                        f"NOT raw ADC counts, NOT a grams calibration.\n")
+                f.write(f"# Processed (mV): real-time (causal) chain -- {proc_desc}. "
+                        f"Has phase delay vs. Value (mV); use Value (mV) for precise timing.\n")
+                f.write(f"Time (s),Value (mV),Processed (mV),{col_header}\n")
+                for i, (t, v, p) in enumerate(self.signal_log_rows):
                     flags = ",".join(str(event_columns[c][i]) for c in col_codes)
-                    f.write(f"{t:.4f},{v:.6g},{flags}\n")
+                    f.write(f"{t:.4f},{v:.6g},{p:.6g},{flags}\n")
         except Exception as e:
             QtWidgets.QMessageBox.warning(
                 self, "Signal Log Error",

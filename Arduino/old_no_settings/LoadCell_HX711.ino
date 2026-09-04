@@ -65,7 +65,8 @@ void loop() {
   // gives up after READ_TIMEOUT_MS if the sensor doesn't respond, instead
   // of blocking forever.
   if (scale.wait_ready_timeout(READ_TIMEOUT_MS)) {
-    long rawValue = scale.read();     // single conversion, no extra averaging
+    //long rawValue = scale.read();     // single conversion, no extra averaging. 
+    long rawValue = scale.get_value(1); // This is the correct way turning the values to zero, not only turning to the original offset
     Serial.println(rawValue);         // raw signal value only
   }
 
